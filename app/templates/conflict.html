@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}冲突核查结果 · VCF 变异核对{% endblock %}
+{% block body %}
+{% set witness_labels = verdict.witness | map(attribute='variant.label') | list %}
+<div class="card">
+  <h2>单样本冲突核查结果</h2>
+  <div class="meta">
+    <span class="pill">参考：{{ ref_name }}（{{ ref_length }} bp）</span>
+    <span class="pill">样本：{{ sample_name }}</span>
+    <span class="pill">归一变异数：{{ items|length }}</span>
+  </div>
+
+  {% if verdict.feasible %}
+  <div class="verdict ok">
+    结论：可行 —— 全部 {{ items|length }} 个归一变异可以共同安排到两条染色体拷贝上。
+    <span class="sub">不存在共享被替换/删除参考碱基却无法分占两条拷贝的调用组合。</span>
+  </div>
+  {% else %}
+  <div class="verdict bad">
+    结论：无解 —— 存在无法共同安排到两条染色体拷贝上的变异组合（共 {{ verdict.witness|length }} 个归一变异）。
+    {% if verdict.reason == "hom_occupied" %}
+    <span class="sub">原因：剂量 2（纯合）变异占满两条拷贝，却与另一变异替换/删除了同一参考碱基，下表高亮的两条记录不能共存。</span>
+    {% else %}
+    <span class="sub">原因：下表高亮的 {{ verdict.witness|length }} 个剂量 1 变异两两之间可安排，但合起来构成奇环冲突，无法分配到两条拷贝。</span>
+    {% endif %}
+  </div>
+  {% endif %}
+  <p><a class="back" href="/">← 返回重新上传</a></p>
+</div>
+
+{% if not verdict.feasible %}
+<div class="card">
+  <h2>导致无解的归一变异（证据）<span class="section-badge b-bad">{{ verdict.witness|length }}</span></h2>
+  <table>
+    <thead>
+      <tr><th style="width:90px">类型</th><th style="width:190px">归一变异（位置:REF→ALT）</th><th style="width:110px">剂量</th><th>受影响参考碱基 / 原始行号与写法</th></tr>
+    </thead>
+    <tbody>
+    {% for item in verdict.witness %}
+      <tr class="witness">
+        <td><span class="tag {{ item.variant.kind }}">{{ item.variant.kind }}</span></td>
+        <td class="mono">{{ item.variant.label }}</td>
+        <td><span class="dose d{{ item.dosage }}">剂量 {{ item.dosage }}</span></td>
+        <td>
+          受影响碱基（1-based）：<span class="mono">{{ item.bases | join(", ") }}</span>
+          <div class="raw">
+            原始行号：{{ item.line_numbers | join(", ") }}<br>
+            原始记录（POS:REF&gt;ALT）：{{ item.raw_descriptions | join("；") }}
+          </div>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>全部归一变异<span class="section-badge b-ok">{{ items|length }}</span></h2>
+  {% if items %}
+  <table>
+    <thead>
+      <tr><th style="width:90px">类型</th><th style="width:190px">归一变异（位置:REF→ALT）</th><th style="width:110px">剂量</th><th>受影响参考碱基 / 原始行号与写法</th></tr>
+    </thead>
+    <tbody>
+    {% for item in items %}
+      <tr {% if item.variant.label in witness_labels %}class="witness"{% endif %}>
+        <td><span class="tag {{ item.variant.kind }}">{{ item.variant.kind }}</span></td>
+        <td class="mono">{{ item.variant.label }}</td>
+        <td><span class="dose d{{ item.dosage }}">剂量 {{ item.dosage }}</span></td>
+        <td>
+          受影响碱基（1-based）：<span class="mono">{{ item.bases | join(", ") }}</span>
+          <div class="raw">
+            原始行号：{{ item.line_numbers | join(", ") }}<br>
+            原始记录（POS:REF&gt;ALT）：{{ item.raw_descriptions | join("；") }}
+          </div>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">VCF 中没有剂量大于 0 的变异调用（如全部为 0/0），核查自然可行。</div>
+  {% endif %}
+</div>
+{% endblock %}

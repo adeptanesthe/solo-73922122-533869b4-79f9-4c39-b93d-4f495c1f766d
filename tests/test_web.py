@@ -43,7 +43,10 @@ class WebTests(unittest.TestCase):
     def test_index_renders(self):
         resp = client.get("/")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("双 VCF 变异核对".encode(), resp.content)
+        self.assertIn("VCF 变异核对".encode(), resp.content)
+        # 原有双 VCF 比对与新增单样本冲突核查两个入口都在
+        self.assertIn('action="/compare"'.encode(), resp.content)
+        self.assertIn('action="/conflict"'.encode(), resp.content)
 
     def test_happy_path_groups_and_line_numbers(self):
         a = vcf([
@@ -146,6 +149,208 @@ class WebTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 422)
         self.assertFalse(resp.json()["ok"])
+
+
+# --------------------------------------------------------------------------- #
+# 单样本冲突核查
+# SEQ = ACGT AAAACGTT（1..12），pos2=C，pos3=G，pos4=T；4:TA>T 删 pos5 的 A
+# --------------------------------------------------------------------------- #
+def upload_conflict(fasta=FASTA, vcf_bytes=None):
+    return client.post(
+        "/conflict",
+        files={
+            "fasta": ("ref.fa", fasta, "text/plain"),
+            "vcf": ("s.vcf", vcf_bytes if vcf_bytes is not None else b"", "text/plain"),
+        },
+    )
+
+
+class ConflictWebTests(unittest.TestCase):
+    def test_feasible_page_shows_ok_verdict_and_bases(self):
+        # 两个不同碱基上的 SNV：无冲突
+        data = vcf([
+            "chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1",
+            "chrT\t3\t.\tG\tT\t.\t.\t.\tGT\t1/1",
+        ])
+        resp = upload_conflict(vcf_bytes=data)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("结论：可行", resp.text)
+        self.assertIn("全部归一变异", resp.text)
+        self.assertIn("受影响碱基", resp.text)
+        # 不出现无解证据区块
+        self.assertNotIn("导致无解", resp.text)
+
+    def test_triangle_same_base_infeasible_with_witness_and_line_numbers(self):
+        # 同一参考碱基 pos2 上三个剂量 1 SNV（三个不同 ALT）：
+        # 任意两条可分占两拷贝，三条合起来无解（奇环）
+        data = vcf([
+            "chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1",   # 行 3
+            "chrT\t2\t.\tC\tT\t.\t.\t.\tGT\t0/1",   # 行 4
+            "chrT\t2\t.\tC\tA\t.\t.\t.\tGT\t0/1",   # 行 5
+        ])
+        resp = upload_conflict(vcf_bytes=data)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("结论：无解", resp.text)
+        self.assertIn("奇环", resp.text)
+        self.assertIn("导致无解的归一变异", resp.text)
+        # 证据含三个归一变异（HTML 中 > 被转义为 &gt;），且保留物理行号
+        self.assertIn("2:C&gt;G", resp.text)
+        self.assertIn("2:C&gt;T", resp.text)
+        self.assertIn("2:C&gt;A", resp.text)
+        self.assertIn("原始行号：3", resp.text)
+        self.assertIn("原始行号：5", resp.text)
+
+    def test_homozygous_dosage_two_collision_infeasible(self):
+        # pos2 的剂量 2 SNV 与 pos2 的另一个剂量 1 SNV 无法共存
+        data = vcf([
+            "chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t1/1",
+            "chrT\t2\t.\tC\tT\t.\t.\t.\tGT\t0/1",
+        ])
+        resp = upload_conflict(vcf_bytes=data)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("结论：无解", resp.text)
+        self.assertIn("剂量 2", resp.text)
+
+    def test_deletion_anchor_not_conflicting_but_deleted_bases_do(self):
+        # 4:TA>T 删 pos5 的 A；锚点 pos4 上的 SNV 不冲突，pos5 上的 SNV 冲突
+        data = vcf([
+            "chrT\t4\t.\tTA\tT\t.\t.\t.\tGT\t0/1",   # 缺失，受影响碱基 5
+            "chrT\t4\t.\tT\tG\t.\t.\t.\tGT\t0/1",    # 锚点 SNV，不冲突
+        ])
+        resp = upload_conflict(vcf_bytes=data)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("结论：可行", resp.text)
+
+        data2 = vcf([
+            "chrT\t4\t.\tTA\tT\t.\t.\t.\tGT\t1/1",   # 剂量 2 缺失
+            "chrT\t5\t.\tA\tC\t.\t.\t.\tGT\t0/1",    # 删除碱基 pos5 上的 SNV
+        ])
+        resp2 = upload_conflict(vcf_bytes=data2)
+        self.assertEqual(resp2.status_code, 200)
+        self.assertIn("结论：无解", resp2.text)
+
+    def test_insertion_rejected_without_partial_conclusion(self):
+        data = vcf(["chrT\t4\t.\tT\tTA\t.\t.\t.\tGT\t0/1"])
+        resp = upload_conflict(vcf_bytes=data)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("核对失败", resp.text)
+        self.assertIn("插入", resp.text)
+        self.assertNotIn("结论：可行", resp.text)
+        self.assertNotIn("结论：无解", resp.text)
+
+    def test_mnv_rejected(self):
+        data = vcf(["chrT\t1\t.\tAC\tGT\t.\t.\t.\tGT\t0/1"])
+        resp = upload_conflict(vcf_bytes=data)
+        self.assertEqual(resp.status_code, 422)
+        self.assertNotIn("单样本冲突核查结果", resp.text)
+
+    def test_ref_mismatch_no_partial_conclusion(self):
+        data = vcf(["chrT\t2\t.\tG\tT\t.\t.\t.\tGT\t0/1"])  # pos2 参考实为 C
+        resp = upload_conflict(vcf_bytes=data)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("核对失败", resp.text)
+        # 输入出错时渲染的是上传页而非结果页：无结果横幅、无证据表、无全部变异表
+        self.assertNotIn("单样本冲突核查结果", resp.text)
+        self.assertNotIn('<div class="verdict', resp.text)
+        self.assertNotIn("全部归一变异", resp.text)
+
+    def test_size_and_empty_limits_reused(self):
+        big_vcf = HEADER.encode() + b"#\n" * (MAX_VCF_BYTES // 2)
+        resp = upload_conflict(vcf_bytes=big_vcf)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("超过大小上限", resp.text)
+
+        resp = upload_conflict(vcf_bytes=b"")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("为空", resp.text)
+
+    def test_empty_variant_set_is_feasible(self):
+        resp = upload_conflict(vcf_bytes=vcf([]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("结论：可行", resp.text)
+
+    def test_api_conflict_feasible(self):
+        data = vcf([
+            "chrT\t2\t.\tC\tG,T\t.\t.\t.\tGT\t1/2",
+            "chrT\t3\t.\tG\tA\t.\t.\t.\tGT\t1/1",
+        ])
+        resp = client.post(
+            "/api/conflict",
+            files={
+                "fasta": ("ref.fa", FASTA, "text/plain"),
+                "vcf": ("s.vcf", data, "text/plain"),
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        result = resp.json()["result"]
+        self.assertTrue(result["feasible"])
+        self.assertEqual(result["reason"], "ok")
+        self.assertEqual(result["witness"], [])
+        labels = {e["variant"]["label"]: e for e in result["all_variants"]}
+        self.assertEqual(labels["2:C>G"]["affected_bases"], [2])
+        self.assertEqual(labels["3:G>A"]["dosage"], 2)
+
+    def test_api_conflict_odd_cycle_witness(self):
+        data = vcf([
+            "chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1",
+            "chrT\t2\t.\tC\tT\t.\t.\t.\tGT\t0/1",
+            "chrT\t2\t.\tC\tA\t.\t.\t.\tGT\t0/1",
+        ])
+        resp = client.post(
+            "/api/conflict",
+            files={
+                "fasta": ("ref.fa", FASTA, "text/plain"),
+                "vcf": ("s.vcf", data, "text/plain"),
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        result = resp.json()["result"]
+        self.assertFalse(result["feasible"])
+        self.assertEqual(result["reason"], "odd_cycle")
+        self.assertEqual(len(result["witness"]), 3)
+        self.assertEqual(
+            sorted(item["variant"]["label"] for item in result["witness"]),
+            ["2:C>A", "2:C>G", "2:C>T"],
+        )
+        # 证据条目必须带原始行号
+        self.assertEqual(
+            sorted(n for item in result["witness"] for n in item["line_numbers"]),
+            [3, 4, 5],
+        )
+
+    def test_api_conflict_hom_reason(self):
+        data = vcf([
+            "chrT\t4\t.\tTA\tT\t.\t.\t.\tGT\t1/1",
+            "chrT\t5\t.\tA\tC\t.\t.\t.\tGT\t0/1",
+        ])
+        resp = client.post(
+            "/api/conflict",
+            files={
+                "fasta": ("ref.fa", FASTA, "text/plain"),
+                "vcf": ("s.vcf", data, "text/plain"),
+            },
+        )
+        result = resp.json()["result"]
+        self.assertFalse(result["feasible"])
+        self.assertEqual(result["reason"], "hom_occupied")
+        self.assertEqual(len(result["witness"]), 2)
+        # 缺失的受影响碱基不含锚点 4，只含被删的 5
+        del_item = next(i for i in result["witness"] if i["variant"]["kind"] == "DEL")
+        self.assertEqual(del_item["affected_bases"], [5])
+
+    def test_api_conflict_input_error(self):
+        data = vcf(["chrT\t4\t.\tT\tTA\t.\t.\t.\tGT\t0/1"])  # 插入
+        resp = client.post(
+            "/api/conflict",
+            files={
+                "fasta": ("ref.fa", FASTA, "text/plain"),
+                "vcf": ("s.vcf", data, "text/plain"),
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+        body = resp.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("插入", body["error"])
 
 
 if __name__ == "__main__":

@@ -8,7 +8,28 @@
 {% endif %}
 
 <div class="card">
-  <h2>上传文件</h2>
+  <h2>单样本冲突核查（新）</h2>
+  <p style="color:var(--muted);font-size:13.5px;margin:0 0 14px">
+    上传参考 FASTA 与一份单样本 VCF，检查全部调用能否共同安排到两条染色体拷贝上：
+    两个变异若替换或删除同一参考碱基（缺失锚点不算），不能占同一拷贝；剂量 1 占一条、剂量 2 占两条。
+  </p>
+  <form action="/conflict" method="post" enctype="multipart/form-data">
+    <label class="field">
+      单条染色体参考 FASTA
+      <span class="hint">（纯 A/C/G/T，不超过 {{ fasta_limit_kib }} KiB）</span>
+      <input type="file" name="fasta" accept=".fa,.fasta,.fna,text/plain" required>
+    </label>
+    <label class="field">
+      待核查 VCF（单样本、二倍体 GT）
+      <span class="hint">（不超过 {{ vcf_limit_kib }} KiB；仅接受单碱基替换与纯缺失，插入或复杂变异直接报错）</span>
+      <input type="file" name="vcf" accept=".vcf,text/plain" required>
+    </label>
+    <button type="submit">开始冲突核查</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>双 VCF 归一化比对（原有功能）</h2>
   <form action="/compare" method="post" enctype="multipart/form-data">
     <label class="field">
       单条染色体参考 FASTA
@@ -25,17 +46,19 @@
       <span class="hint">（不超过 {{ vcf_limit_kib }} KiB）</span>
       <input type="file" name="vcf_b" accept=".vcf,text/plain" required>
     </label>
-    <button type="submit">开始核对</button>
+    <button type="submit">开始比对</button>
   </form>
 </div>
 
 <div class="card rules">
   <h2 style="color:var(--ink)">接收与判定规则</h2>
   <ul>
-    <li>仅接受 A/C/G/T 构成的<strong>单碱基替换</strong>，以及事件长度不超过 20 bp 的<strong>纯插入 / 纯缺失</strong>；其他形态（MNV、符号化 ALT、* 等）直接判失败。</li>
+    <li><strong>双 VCF 比对</strong>：接受 A/C/G/T 构成的单碱基替换，以及事件长度不超过 20 bp 的纯插入 / 纯缺失；其他形态（MNV、符号化 ALT、* 等）直接判失败。</li>
+    <li><strong>单样本冲突核查</strong>：仅接受<strong>单碱基替换</strong>与<strong>纯缺失</strong>；出现插入或复杂变异（MNV 等）直接判失败，不展示局部结论。</li>
     <li>GT 必须为<strong>非缺失、未分相的二倍体</strong>（形如 <span class="mono">0/1</span>、<span class="mono">1/1</span>，多 ALT 可为 <span class="mono">1/2</span>）；按 GT 分别计算各 ALT 的 0/1/2 剂量，剂量为 0 的变异忽略。</li>
     <li>插入、缺失对照参考做左对齐归一：重复区域中位置写法不同的同一 indel 归为同一等位变异。</li>
     <li>REF 与参考序列不符，或同一文件内同一归一变异存在互相矛盾的剂量时，<strong>整次核对失败</strong>，不展示局部结论。</li>
+    <li>冲突判定：两个变异替换或删除<strong>同一参考碱基</strong>即不能占同一拷贝（缺失的锚定碱基不计入被删碱基）；冲突图含奇环（含同一碱基上三个剂量 1 变异）或剂量 2 变异与他者共享碱基时无解，页面给出导致无解的归一变异与原始行号。</li>
   </ul>
 </div>
 {% endblock %}

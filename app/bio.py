@@ -64,6 +64,35 @@ class Call:
     raw_descriptions: list[str] = field(default_factory=list)
 
 
+# 单样本冲突核查接受的变异形态（仅单碱基替换与纯缺失）
+CONFLICT_ALLOWED_KINDS = frozenset({"SNV", "DEL"})
+
+
+@dataclass(frozen=True)
+class ConflictItem:
+    """冲突结论中的一条归一变异及其来源记录。"""
+
+    variant: "Variant"
+    dosage: int
+    line_numbers: list[int]
+    raw_descriptions: list[str]
+    bases: tuple[int, ...]  # 该变异替换/删除的参考碱基（1-based，不含缺失锚点）
+
+
+@dataclass(frozen=True)
+class ConflictVerdict:
+    """单样本冲突核查结论。
+
+    feasible 为 True 时全部调用可安排到两条染色体拷贝上；
+    为 False 时 reason 给出无解原因，witness 是一组导致无解的归一变异
+    （剂量 2 与相邻变异直接成对无解，否则为剂量 1 之间的奇环）。
+    """
+
+    feasible: bool
+    reason: str  # "ok" | "hom_occupied" | "odd_cycle"
+    witness: tuple[ConflictItem, ...] = ()
+
+
 # --------------------------------------------------------------------------- #
 # FASTA
 # --------------------------------------------------------------------------- #
@@ -208,9 +237,15 @@ def parse_diploid_gt(gt: str, line_no: int, n_alt: int) -> dict[int, int]:
 # VCF
 # --------------------------------------------------------------------------- #
 def _parse_record(
-    fields: list[str], line_no: int, refobj: Reference
+    fields: list[str],
+    line_no: int,
+    refobj: Reference,
+    allowed_kinds: frozenset[str] | None = None,
 ) -> dict[Variant, int]:
-    """解析一条 VCF 数据行，返回该行内 {归一变异: 剂量}（已剔除剂量 0 并在记录内聚合）。"""
+    """解析一条 VCF 数据行，返回该行内 {归一变异: 剂量}（已剔除剂量 0 并在记录内聚合）。
+
+    allowed_kinds 给定时，归一后形态不在集合中的变异（如插入）判整次失败。
+    """
     if len(fields) < 8:
         raise CheckError(f"第 {line_no} 行：列数不足 8 列，不是合法 VCF 记录。")
 
@@ -273,13 +308,31 @@ def _parse_record(
         alt = alts[alt_idx - 1]
         npos, nref, nalt = normalize(pos, ref, alt, refobj.sequence)
         kind = classify(nref, nalt)  # 同时承担长度与形态校验
+        if allowed_kinds is not None and kind not in allowed_kinds:
+            if kind == "INS":
+                raise CheckError(
+                    f"第 {line_no} 行：单样本冲突核查仅接受单碱基替换与纯缺失，"
+                    f"发现插入变异（{npos}:{nref}ins{nalt}），整次核查失败。"
+                )
+            raise CheckError(
+                f"第 {line_no} 行：单样本冲突核查仅接受单碱基替换与纯缺失，"
+                f"发现不支持的变异形态（{kind}，REF={nref}, ALT={nalt}），整次核查失败。"
+            )
         variant = Variant(npos, nref, nalt, kind)
         per_record[variant] = per_record.get(variant, 0) + dose
     return per_record
 
 
-def parse_vcf(data: bytes, filename: str, refobj: Reference) -> dict[Variant, Call]:
-    """解析单样本 VCF，返回 {归一变异: Call}。任何硬性错误都抛出 CheckError。"""
+def parse_vcf(
+    data: bytes,
+    filename: str,
+    refobj: Reference,
+    allowed_kinds: frozenset[str] | None = None,
+) -> dict[Variant, Call]:
+    """解析单样本 VCF，返回 {归一变异: Call}。任何硬性错误都抛出 CheckError。
+
+    allowed_kinds 给定时（如单样本冲突核查仅允许 SNV/DEL），其他归一形态直接判失败。
+    """
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -313,7 +366,7 @@ def parse_vcf(data: bytes, filename: str, refobj: Reference) -> dict[Variant, Ca
         if not line or line.startswith("#"):
             continue
         fields = line.split("\t")
-        record_calls = _parse_record(fields, offset, refobj)
+        record_calls = _parse_record(fields, offset, refobj, allowed_kinds)
         raw_desc = f"{fields[1]}:{fields[3]}>{fields[4]}"
         for variant, dose in record_calls.items():
             existing = calls.get(variant)
@@ -378,3 +431,165 @@ def compare(
         "right_only": right_only,
         "dosage_mismatch": dosage_mismatch,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 单样本冲突核查（两条染色体拷贝能否共同安排全部调用）
+# --------------------------------------------------------------------------- #
+def affected_bases(variant: Variant) -> tuple[int, ...]:
+    """返回变异替换或删除的参考碱基（1-based，有序、无重复）。
+
+    - SNV：被替换的单个碱基位置；
+    - DEL：被删除序列的位置（归一化 ref 的第 2 个碱基起，锚定碱基不计入）；
+    锚定碱基本身不被任何变异替换/删除，因此两个变异在锚点上不构成冲突。
+    """
+    if variant.kind == "SNV":
+        return (variant.pos,)
+    if variant.kind == "DEL":
+        # 归一化后 ref = 锚定碱基 + 被删序列，被删位置为 pos+1 .. pos+len(ref)-1
+        return tuple(range(variant.pos + 1, variant.pos + len(variant.ref)))
+    raise CheckError(
+        f"单样本冲突核查仅接受单碱基替换与纯缺失，发现 {variant.kind} 变异 {variant.label}。"
+    )
+
+
+def _make_item(variant: Variant, call: Call, bases: tuple[int, ...]) -> ConflictItem:
+    return ConflictItem(
+        variant=variant,
+        dosage=call.dosage,
+        line_numbers=list(call.line_numbers),
+        raw_descriptions=list(call.raw_descriptions),
+        bases=bases,
+    )
+
+
+def build_items(calls: dict[Variant, Call]) -> list[ConflictItem]:
+    """把全部调用按归一变异排序，展开为带受影响参考碱基的条目列表。"""
+    return [
+        _make_item(variant, calls[variant], affected_bases(variant))
+        for variant in sorted(calls, key=lambda v: (v.pos, v.ref, v.alt))
+    ]
+
+
+def check_conflicts(
+    calls: dict[Variant, Call],
+) -> ConflictVerdict:
+    """检查单样本全部调用能否共同安排到两条染色体拷贝上。
+
+    冲突定义：两个变异替换或删除了同一个参考碱基（缺失锚点不计）即不能占同一拷贝。
+    剂量 1 的变异占一条拷贝，剂量 2 占两条。
+
+    判定：
+    - 剂量 2 的变异与任何变异共享参考碱基 -> 直接无解（成对证据）；
+    - 其余冲突全部发生在剂量 1 之间，冲突图可二染色（无奇环）才可安排；
+      奇环即“任意两条可安排、合起来无解”的情形，例如同一碱基上的三个剂量 1 SNV。
+    """
+    variants = sorted(calls, key=lambda v: (v.pos, v.ref, v.alt))
+    base_map = {v: affected_bases(v) for v in variants}
+
+    # 建冲突图：边连接共享被替换/删除参考碱基的两个变异
+    base_owners: dict[int, list[int]] = {}
+    adjacency: list[set[int]] = [set() for _ in variants]
+    for i, variant in enumerate(variants):
+        for base in base_map[variant]:
+            owners = base_owners.setdefault(base, [])
+            for j in owners:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+            owners.append(i)
+
+    # 1) 剂量 2 的变异占满两条拷贝：与任何相邻变异都无法共存
+    for i, variant in enumerate(variants):
+        if calls[variant].dosage == 2 and adjacency[i]:
+            j = min(adjacency[i])
+            witness = (
+                _make_item(variant, calls[variant], base_map[variant]),
+                _make_item(variants[j], calls[variants[j]], base_map[variants[j]]),
+            )
+            return ConflictVerdict(
+                feasible=False, reason="hom_occupied", witness=witness
+            )
+
+    # 2) 剂量 1 之间的冲突图必须可二染色（BFS 二分图判定）
+    color: dict[int, int] = {}
+    for start in range(len(variants)):
+        if start in color or not adjacency[start]:
+            # 孤立点（无冲突）放哪条拷贝都可以，无需染色
+            if start not in color:
+                color[start] = 0
+            continue
+        color[start] = 0
+        queue = [start]
+        head = 0
+        while head < len(queue):
+            u = queue[head]
+            head += 1
+            for w in adjacency[u]:
+                if w not in color:
+                    color[w] = color[u] ^ 1
+                    queue.append(w)
+                elif color[w] == color[u]:
+                    # 发现奇环：沿 BFS 父树回溯到 LCA，取出干净的奇环作为证据
+                    parent = _bfs_parents(adjacency, start)
+                    cycle = _odd_cycle(parent, u, w)
+                    witness = tuple(
+                        _make_item(variants[k], calls[variants[k]], base_map[variants[k]])
+                        for k in cycle
+                    )
+                    return ConflictVerdict(
+                        feasible=False, reason="odd_cycle", witness=witness
+                    )
+
+    return ConflictVerdict(feasible=True, reason="ok")
+
+
+def _bfs_parents(adjacency: list[set[int]], start: int) -> dict[int, int]:
+    """从 start 做 BFS，返回每个可达点的父节点（不含起点）。"""
+    parent: dict[int, int] = {}
+    seen = {start}
+    queue = [start]
+    head = 0
+    while head < len(queue):
+        u = queue[head]
+        head += 1
+        for w in sorted(adjacency[u]):
+            if w not in seen:
+                seen.add(w)
+                parent[w] = u
+                queue.append(w)
+    return parent
+
+
+def _odd_cycle(parent: dict[int, int], u: int, w: int) -> list[int]:
+    """由同色边 (u, w) 与 BFS 父树构造奇环节点序列（首尾不重复）。"""
+    ancestors_u: list[int] = []
+    x = u
+    while x in parent:
+        ancestors_u.append(x)
+        x = parent[x]
+    ancestors_u.append(x)  # 根（BFS 起点）
+
+    ancestors_w: list[int] = []
+    y = w
+    while y in parent:
+        ancestors_w.append(y)
+        y = parent[y]
+    ancestors_w.append(y)
+
+    set_u = set(ancestors_u)
+    lca = next(a for a in ancestors_w if a in set_u)
+
+    path_u: list[int] = []
+    x = u
+    while x != lca:
+        path_u.append(x)
+        x = parent[x]
+    path_u.append(lca)
+
+    path_w_rev: list[int] = []
+    y = w
+    while y != lca:
+        path_w_rev.append(y)
+        y = parent[y]
+
+    return path_u + path_w_rev  # lca 只出现一次，闭合边为 (u, w)
